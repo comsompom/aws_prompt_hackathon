@@ -1,5 +1,7 @@
 # Production-Ready On-Chain Purchase Notification Pipeline (AWS)
 
+![Project Logo](aws_prompt_logo.jpg)
+
 A production-ready, serverless blueprint for handling purchase webhooks from a public website widget and turning them into secure, reliable, and auditable events on AWS.
 
 This repository contains the project context and submission assets for an AWS prompt challenge. The core prompt is designed to generate a full implementation with Terraform and Lambda for secure webhook ingestion, deduplication, storage, and email notifications.
