@@ -10,6 +10,14 @@ The payload is untrusted; the sender is anonymous. Volume is low (< 1000/day) bu
 each event is financially significant — duplicates and missed notifications are
 unacceptable.
 
+SUBMISSION GOAL
+
+The generated repository must be good enough for two purposes at once:
+1. a developer can deploy it with minimal adaptation;
+2. it reads like a high-quality AWS prompt challenge submission with clear
+   prerequisites, use case, expected outcome, AWS service mapping, security
+   controls, cost controls, and troubleshooting guidance.
+
 EXACT PAYLOAD CONTRACT  ← pin this; do not invent fields
 
 POST body (application/json):
@@ -67,11 +75,15 @@ Encryption: aws_managed_key (SSE-KMS, use the default DynamoDB-owned key unless
 TERRAFORM MODULE STRUCTURE  ← exact file tree required
 
 infra/
-  main.tf                — provider config, backend (S3+DynamoDB lock), module calls
+  main.tf                — provider config, partial backend block (S3+DynamoDB lock),
+                           module calls
   variables.tf           — project, stage, region, owner_email,
-                           webhook_secret_ssm_path, use_cmk, alarm_email
+                           webhook_secret_ssm_path, use_cmk, alarm_email,
+                           admin_cors_origin, ses_identity_type, ses_identity_value
   outputs.tf             — api_gateway_url, table_name, log_group_name
   terraform.tfvars.example
+  backend.hcl.example    — bucket, key, region, dynamodb_table placeholders used by
+                           terraform init -backend-config=backend.hcl
 
   modules/
     api_gateway/
@@ -121,7 +133,7 @@ infra/
                            two alarms: lambda_errors (>0 in 5min) and
                            api_5xx (>2 in 5min), SNS topic for alarm_email,
                            dashboard with 4 widgets: invocations, errors,
-                           p99 duration, DynamoDB write capacity
+                           p99 duration, DynamoDB consumed write units
       variables.tf
       outputs.tf         — dashboard_url, alarm_topic_arn
 
@@ -137,6 +149,27 @@ Lambda source lives outside infra/:
   scripts/
     build_lambda.sh      — builds zips for both functions into infra/lambda_zips/
     smoke_test.sh        — full smoke test with signed curl calls
+
+DOCUMENTATION ARTIFACTS  ← required for challenge-quality output
+
+Generate:
+  README.md
+    Must include these sections exactly:
+      - Problem / Use Case
+      - Intended Audience
+      - Prerequisites
+      - Expected Outcome
+      - Architecture Overview
+      - AWS Services Used
+      - Security Controls
+      - Reliability and Operations
+      - Cost Controls
+      - Deployment Steps
+      - Smoke Test Summary
+      - AWS Well-Architected Mapping
+  TROUBLESHOOTING.md
+    Must include at least 8 realistic failure modes with symptom, likely cause,
+    and corrective action.
 
 LAMBDA IMPLEMENTATION REQUIREMENTS
 
@@ -185,7 +218,8 @@ purchases_reader.py:
     KeyConditionExpression: wallet_gsi = :w AND received_at BETWEEN :from AND :to
     If from/to absent: default to last 30 days
   Return: {"purchases": [...], "count": N, "wallet": "..."}
-  Max 100 items per call (Limit=100); add LastEvaluatedKey pagination if needed.
+  Max 100 items per call (Limit=100); add LastEvaluatedKey pagination if needed and
+  include next_cursor in the response when more data exists.
   Strip buyer_email from response (PII — admin API should not expose it).
 
 API GATEWAY SPECIFICS
@@ -206,7 +240,9 @@ GET /purchases:
   Integration: Lambda proxy
   Request validator: validate query string params
   Required query param: wallet
-  No API key required (internal network or future mTLS — add a comment)
+  Authorization: AWS_IAM
+  Do not treat API keys as authentication. Add a code comment explaining that
+  SigV4-signed requests are required because this is an admin data endpoint.
 
 CORS:
   POST endpoint: allow origin *, allow headers Content-Type + X-Signature
@@ -257,12 +293,15 @@ Steps (each as a numbered bash block with set -euo pipefail):
        cd src/webhook_handler && pip install -r requirements.txt -t package/
        cp handler.py package/ && cd package && zip -r ../../infra/lambda_zips/webhook.zip .
        (same pattern for purchases_reader)
-  4. terraform init -backend-config=...
+  4. Create backend.hcl from backend.hcl.example, then run:
+       terraform init -backend-config=backend.hcl
   5. terraform plan -var-file=terraform.tfvars -out=tfplan
   6. terraform apply tfplan
   7. Run smoke_test.sh (see below)
-  8. Rollback: terraform apply -target=module.lambda -var image_tag=<previous>
-     OR aws lambda update-function-code --function-name ... --zip-file ...
+  8. Rollback:
+       - preferred: re-apply the previous Terraform commit/state
+       - emergency: aws lambda update-function-code --function-name ... --zip-file ...
+     Do not mention image_tag or container rollback; this solution uses zip artifacts.
 
 SMOKE TEST SCRIPT (scripts/smoke_test.sh)
 
@@ -275,7 +314,8 @@ Generate a complete bash script that:
   5. Sends identical POST again — asserts 200 with status=duplicate
   6. Sends POST with wrong signature — asserts 401
   7. Sends POST with missing field — asserts 422
-  8. Sends GET /purchases?wallet=<wallet> — asserts 200 and count >= 1
+  8. Sends GET /purchases?wallet=<wallet> as a SigV4-signed request — asserts 200 and
+     count >= 1; use curl --aws-sigv4 when available and include an AWS CLI fallback
   9. Checks DynamoDB directly:
        aws dynamodb get-item --table-name "$TABLE" \
          --key '{"PK":{"S":"PURCHASE"},"SK":{"S":"<idempotency_key>"}}'
@@ -306,30 +346,55 @@ Document these specific decisions where the relevant resource appears:
     delayed notification)
   - Why buyer_email excluded from GET response (PII minimisation, GDPR)
   - Why DynamoDB TTL set even though no expiry needed yet (cheap; hard to add later)
+  - Why GET /purchases uses AWS_IAM instead of API key auth (admin data, real auth)
+
+TERRAFORM BACKEND RULE
+
+Because Terraform backends cannot depend on normal input variables, generate:
+  - a partial backend "s3" block in infra/main.tf with no hard-coded secrets
+  - infra/backend.hcl.example with placeholder values
+  - deploy.sh instructions that copy backend.hcl.example to backend.hcl and fill it in
+Do not invent backend bucket names or pretend backend configuration can be driven from
+terraform.tfvars.
 
 OUTPUT FORMAT
 
 Output each file as a fenced code block with the path as the filename comment
 on the first line. Files in this order:
   1. Architecture diagram (ASCII, max 60 cols wide)
-  2. infra/variables.tf
-  3. infra/main.tf
-  4. infra/outputs.tf
-  5. modules/dynamodb/main.tf + kms.tf
-  6. modules/lambda/main.tf + iam.tf
-  7. modules/api_gateway/main.tf
-  8. modules/monitoring/main.tf
-  9. modules/ssm/main.tf
-  10. modules/ses/main.tf
-  11. src/webhook_handler/handler.py
-  12. src/webhook_handler/requirements.txt
-  13. src/purchases_reader/handler.py
-  14. src/purchases_reader/requirements.txt
-  15. scripts/build_lambda.sh
-  16. scripts/smoke_test.sh
-  17. scripts/deploy.sh
-  18. frontend/webhook-client.ts
-  19. terraform.tfvars.example
-  20. TROUBLESHOOTING.md
+  2. README.md
+  3. TROUBLESHOOTING.md
+  4. infra/variables.tf
+  5. infra/main.tf
+  6. infra/outputs.tf
+  7. infra/terraform.tfvars.example
+  8. infra/backend.hcl.example
+  9. infra/modules/dynamodb/main.tf
+  10. infra/modules/dynamodb/kms.tf
+  11. infra/modules/dynamodb/variables.tf
+  12. infra/modules/dynamodb/outputs.tf
+  13. infra/modules/lambda/main.tf
+  14. infra/modules/lambda/iam.tf
+  15. infra/modules/lambda/variables.tf
+  16. infra/modules/lambda/outputs.tf
+  17. infra/modules/api_gateway/main.tf
+  18. infra/modules/api_gateway/variables.tf
+  19. infra/modules/api_gateway/outputs.tf
+  20. infra/modules/monitoring/main.tf
+  21. infra/modules/monitoring/variables.tf
+  22. infra/modules/monitoring/outputs.tf
+  23. infra/modules/ssm/main.tf
+  24. infra/modules/ssm/outputs.tf
+  25. infra/modules/ses/main.tf
+  26. infra/modules/ses/variables.tf
+  27. infra/modules/ses/outputs.tf
+  28. src/webhook_handler/handler.py
+  29. src/webhook_handler/requirements.txt
+  30. src/purchases_reader/handler.py
+  31. src/purchases_reader/requirements.txt
+  32. scripts/build_lambda.sh
+  33. scripts/smoke_test.sh
+  34. scripts/deploy.sh
+  35. frontend/webhook-client.ts
 
 Do not truncate any file. If a file would be very long, write it in full anyway.
